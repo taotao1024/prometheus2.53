@@ -6,7 +6,7 @@ require (
 	github.com/alecthomas/kingpin/v2 v2.4.0
 	github.com/go-kit/log v0.2.1
 	github.com/gogo/protobuf v1.3.2
-	github.com/golang/snappy v0.0.4
+	github.com/golang/snappy v1.0.0
 	github.com/influxdata/influxdb v1.11.5
 	github.com/prometheus/client_golang v1.19.1
 	github.com/prometheus/common v0.54.0
