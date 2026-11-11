@@ -1023,6 +1023,8 @@ func main() {
 					level.Warn(logger).Log("msg", "Received an OS signal, exiting gracefully...", "signal", sig.String())
 					reloadReady.Close()
 				case <-webHandler.Quit():
+					// 如果通过API的方式调用quit()方法 Prometheus服务会被关闭
+					// curl -X PUT http://127.0.0.1:9090/-/quit
 					level.Warn(logger).Log("msg", "Received termination request via web service, exiting gracefully...")
 				case <-cancel:
 					reloadReady.Close()
@@ -1130,7 +1132,8 @@ func main() {
 	{
 		// Reload handler.
 		// 7.启动Reload handler 监听系统信号，如接收到HUP信号，则prometheus 重新加载配置文件。
-
+		// kill -HUP <Prometheus Pid> 可以热更新配置文件
+		//
 		// Make sure that sighup handler is registered with a redirect to the channel before the potentially
 		// long and synchronous tsdb init.
 		hup := make(chan os.Signal, 1)
@@ -1143,10 +1146,13 @@ func main() {
 				for {
 					select {
 					case <-hup: // 接收到HUP信号，则prometheus 重新加载配置文件
+						// 手动触发 kill -HUP <Prometheus Pid> 可以热更新配置文件
 						if err := reloadConfig(cfg.configFile, cfg.enableExpandExternalLabels, cfg.tsdb.EnableExemplarStorage, logger, noStepSubqueryInterval, reloaders...); err != nil {
 							level.Error(logger).Log("msg", "Error reloading config", "err", err)
 						}
-					case rc := <-webHandler.Reload():
+					case rc := <-webHandler.Reload(): // Api第三方调用reload() 重新加载配置文件
+						// 通过API触发热更新，需要开启 --web.enable-lifecycle 参数
+						// 手动触发 curl -X POST http://127.0.0.1:9090/-/reload  可以热更新配置文件
 						if err := reloadConfig(cfg.configFile, cfg.enableExpandExternalLabels, cfg.tsdb.EnableExemplarStorage, logger, noStepSubqueryInterval, reloaders...); err != nil {
 							level.Error(logger).Log("msg", "Error reloading config", "err", err)
 							rc <- err
