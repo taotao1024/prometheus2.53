@@ -383,7 +383,28 @@ func New(logger log.Logger, o *Options) *Handler {
 	})
 
 	router.Get("/version", h.version)
-	router.Get("/metrics", promhttp.Handler().ServeHTTP)
+	// router.Get("/metrics", promhttp.Handler().ServeHTTP) 与下面方法功能相同 {{
+	router.Get("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		promhttp.Handler().ServeHTTP(w, r)
+
+		fmt.Println("method:", r.Method)
+		fmt.Println("url:", r.Host, r.URL)
+		for k, v := range r.Header {
+			vals := strings.Join(v, ";;")
+			fmt.Println("header:", k, ":", vals)
+		}
+
+		for k, v := range r.URL.Query() {
+			vals := strings.Join(v, ";;")
+			fmt.Println("query:", k, ":", vals)
+		}
+
+		all, _ := io.ReadAll(r.Body)
+		if len(all) > 0 {
+			fmt.Println("body:", string(all))
+		}
+	})
+	// }}
 
 	router.Get("/federate", readyf(httputil.CompressionHandler{
 		Handler: http.HandlerFunc(h.federation),

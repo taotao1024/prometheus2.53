@@ -84,24 +84,33 @@ import (
 )
 
 var (
+	// appName 是应用程序名称，用于版本信息采集与展示。
 	appName = "prometheus"
 
+	// configSuccess 记录最近一次配置重载是否成功（1 表示成功，0 表示失败）。
 	configSuccess = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "prometheus_config_last_reload_successful",
 		Help: "Whether the last configuration reload attempt was successful.",
 	})
+	// configSuccessTime 记录最近一次成功重载配置的时间戳。
 	configSuccessTime = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "prometheus_config_last_reload_success_timestamp_seconds",
 		Help: "Timestamp of the last successful configuration reload.",
 	})
 
-	defaultRetentionString   = "15d"
+	// defaultRetentionString 是默认的样本数据保留时长（15 天）。
+	defaultRetentionString = "15d"
+	// defaultRetentionDuration 是 defaultRetentionString 解析后的 model.Duration 值。
 	defaultRetentionDuration model.Duration
 
-	agentMode                       bool
+	// agentMode 标识当前是否以 Agent 模式运行（通过 --enable-feature=agent 开启）。
+	agentMode bool
+	// agentOnlyFlags、serverOnlyFlags 分别记录用户实际传入的仅限 Agent 模式、
+	// 仅限 Server 模式使用的 flag 名称，用于启动时校验 flag 与运行模式是否匹配。
 	agentOnlyFlags, serverOnlyFlags []string
 )
 
+// init 在程序启动前完成初始化：注册构建版本信息采集器，并解析默认的数据保留时长。
 func init() {
 	prometheus.MustRegister(versioncollector.NewCollector(strings.ReplaceAll(appName, "-", "_")))
 
@@ -132,6 +141,9 @@ func agentOnlyFlag(app *kingpin.Application, name, help string) *kingpin.FlagCla
 		})
 }
 
+// flagConfig 汇总了从命令行 flag 解析出的所有启动配置，涵盖 Web、通知、
+// 抓取、TSDB/Agent 存储、查询、规则评估以及特性开关（featureList）等
+// 各组件的选项，是 main 函数构建各核心组件时的配置来源。
 type flagConfig struct {
 	configFile string
 
@@ -244,6 +256,18 @@ func (c *flagConfig) setFeatureListOptions(logger log.Logger) error {
 	return nil
 }
 
+// main 是 Prometheus 的程序入口，同时支持 Server 模式与 Agent 模式。
+// 主要流程：
+//  1. 解析并校验命令行 flag 与配置文件，处理保留策略等派生配置；
+//  2. 构建各核心组件（本地存储、远程存储、服务发现、抓取、通知、
+//     查询引擎、规则管理器、Web 处理器、链路追踪等）；
+//  3. 通过 run.Group 并发运行各组件，并注册 SIGHUP/SIGTERM 等信号处理；
+//  4. 等待本地存储（TSDB/WAL）就绪后加载初始配置，将 Web 服务标记为可
+//     接收请求；收到退出信号时统一协调各组件优雅停止。
+/**
+ * Prometheus中 使用goroutine库 管理分模块的启动
+ * SkyWalking中 使用SPI机制 管理各模块的启动
+ */
 func main() {
 	if os.Getenv("DEBUG") != "" {
 		runtime.SetBlockProfileRate(20)
@@ -283,7 +307,7 @@ func main() {
 	a.Version(version.Print(appName))
 
 	a.HelpFlag.Short('h')
-
+	// 设置启动参数，解析参数 ./prometheus --config.file=prometheus.yml
 	a.Flag("config.file", "Prometheus configuration file path.").
 		Default("prometheus.yml").StringVar(&cfg.configFile)
 
@@ -528,6 +552,8 @@ func main() {
 	}
 
 	// Throw error for invalid config before starting other components.
+	// 在启动其他组件之前，对无效的配置抛出错误。
+	// 根据启动参数 config.file 获取配置文件，校验配置文件的配置
 	var cfgFile *config.Config
 	if cfgFile, err = config.LoadFile(cfg.configFile, agentMode, false, log.NewNopLogger()); err != nil {
 		absPath, pathErr := filepath.Abs(cfg.configFile)
@@ -562,6 +588,11 @@ func main() {
 	// but if we don't do it now, the metrics will stay at zero until the
 	// startup procedure is complete, which might take long enough to
 	// trigger alerts about an invalid config.
+	// 既然配置的有效性已经确定，就相应地设置配置成功指标，尽管配置实际上还没有真正加载。
+	// 这将在稍后发生（包括再次设置这些指标），但如果我们现在不这样做，指标将保持为零，
+	// 直到启动过程完成，而这个过程可能足够长，从而触发关于无效配置的警报。
+
+	// 配置文件校验通过，设置配置成功指标为 1
 	configSuccess.Set(1)
 	configSuccessTime.SetToCurrentTime()
 
@@ -970,15 +1001,23 @@ func main() {
 		os.Exit(1)
 	}
 
+	// 配置文件验证通过，使用第三方库run 开启各个代码模块：
 	var g run.Group
 	{
-		// Termination handler.
+		// Termination handler. 监听信号
+		// 1.开启 Termination handler 监听系统信号，
+		// 如接收到TERM(kill -15 pid)、Interrupt (ctrl +c )信号，则 promethous 退出
 		term := make(chan os.Signal, 1)
-		signal.Notify(term, os.Interrupt, syscall.SIGTERM)
+		// 监听系统信号，当收到SIGTERM信号时，关闭reloadReady通道，退出程序
+		// os.Interrupt 		信号值=2 	表示ctrl+c
+		// syscall.SIGTERM  	信号值=15  	表示kill
+		signal.Notify(term, os.Interrupt, syscall.SIGTERM) // 信号值=2|15
 		cancel := make(chan struct{})
 		g.Add(
 			func() error {
 				// Don't forget to release the reloadReady channel so that waiting blocks can exit normally.
+				// 别忘了释放 reloadReady 通道，以便等待的阻塞可以正常退出。
+				// term 和 webHandler.Quit() 都表示收到信号，退出程序
 				select {
 				case sig := <-term:
 					level.Warn(logger).Log("msg", "Received an OS signal, exiting gracefully...", "signal", sig.String())
@@ -997,7 +1036,9 @@ func main() {
 		)
 	}
 	{
-		// Scrape discovery manager.
+		// Scrape discovery manager. 被监控对象地址
+		// 2.开启 Scrape discovery manager，对被监控对象target进行服务发现。
+		// 将获取到的地址发送到自身的chan,供Scrape manager模块获取
 		g.Add(
 			func() error {
 				err := discoveryManagerScrape.Run()
@@ -1011,7 +1052,9 @@ func main() {
 		)
 	}
 	{
-		// Notify discovery manager.
+		// Notify discovery manager. 告警
+		// 3.开启 Notify discovery manager，对告警服务进行服务发现，获取AlterManager地址。
+		// 将获取到的AlterManager地址发送到自身的chan,供Scrape manager模块获取
 		g.Add(
 			func() error {
 				err := discoveryManagerNotify.Run()
@@ -1024,8 +1067,10 @@ func main() {
 			},
 		)
 	}
+
+	// 4.如果不是代理模式，开启Rule manager模块，否则不开启。
 	if !agentMode {
-		// Rule manager.
+		// Rule manager. 规则管理器
 		g.Add(
 			func() error {
 				<-reloadReady.C
@@ -1038,7 +1083,8 @@ func main() {
 		)
 	}
 	{
-		// Scrape manager.
+		// Scrape manager. 刮削管理器
+		// 5.启动Scrape manager模块，Scrape manager启动后，监听服务发现的chan,获取最新的被监控对象的地址，拉取监控指标。
 		g.Add(
 			func() error {
 				// When the scrape manager receives a new targets list
@@ -1063,6 +1109,13 @@ func main() {
 	}
 	{
 		// Tracing manager.
+		// 6.启动Tracing manager 链路追踪 基于OpenTelemetry协议 数据格式如下:
+		// # TYPE node_disk_info gauge
+		// node_disk_info{device="dm-0",major="253",minor="0",model="",path="",revision="",serial="",wwn=""} 1
+		// node_disk_info{device="dm-1",major="253",minor="1",model="",path="",revision="",serial="",wwn=""} 1
+		// node_disk_info{device="dm-2",major="253",minor="2",model="",path="",revision="",serial="",wwn=""} 1
+		// node_disk_info{device="sda",major="8",minor="0",model="",path="",revision="",serial="",wwn=""} 1
+		// node_disk_info{device="sr0",major="11",minor="0",model="",path="",revision="",serial="",wwn=""} 1
 		g.Add(
 			func() error {
 				<-reloadReady.C
@@ -1076,6 +1129,7 @@ func main() {
 	}
 	{
 		// Reload handler.
+		// 7.启动Reload handler 监听系统信号，如接收到HUP信号，则prometheus 重新加载配置文件。
 
 		// Make sure that sighup handler is registered with a redirect to the channel before the potentially
 		// long and synchronous tsdb init.
@@ -1088,7 +1142,7 @@ func main() {
 
 				for {
 					select {
-					case <-hup:
+					case <-hup: // 接收到HUP信号，则prometheus 重新加载配置文件
 						if err := reloadConfig(cfg.configFile, cfg.enableExpandExternalLabels, cfg.tsdb.EnableExemplarStorage, logger, noStepSubqueryInterval, reloaders...); err != nil {
 							level.Error(logger).Log("msg", "Error reloading config", "err", err)
 						}
@@ -1113,14 +1167,16 @@ func main() {
 	}
 	{
 		// Initial configuration loading.
+		// 8.开启WAL模块或者TSDB之后，加载配置文件config.file内容
+		// 在 WAL模块和TSDB模块启动之前会一直阻塞，启动后会发送dbOpen被关闭的信号
 		cancel := make(chan struct{})
 		g.Add(
 			func() error {
 				select {
-				case <-dbOpen:
+				case <-dbOpen: // 接受dbOpen的信号，表示TSDB模块 | WAL已经启动完成
 				// In case a shutdown is initiated before the dbOpen is released
 				case <-cancel:
-					reloadReady.Close()
+					reloadReady.Close() // 关闭reloadReady，表示配置文件加载完成 会发送信号
 					return nil
 				}
 
@@ -1128,7 +1184,7 @@ func main() {
 					return fmt.Errorf("error loading config from %q: %w", cfg.configFile, err)
 				}
 
-				reloadReady.Close()
+				reloadReady.Close() // 关闭reloadReady，表示配置文件加载完成 会发送信号
 
 				webHandler.SetReady(true)
 				level.Info(logger).Log("msg", "Server is ready to receive web requests.")
@@ -1140,8 +1196,10 @@ func main() {
 			},
 		)
 	}
+	// 如果是代理模式，开启 WAL storage 模块；
+	// 9.如果不是代理模式，启动TSDB
 	if !agentMode {
-		// TSDB.
+		// TSDB. 本地存储
 		opts := cfg.tsdb.ToTSDBOptions()
 		cancel := make(chan struct{})
 		g.Add(
@@ -1183,8 +1241,9 @@ func main() {
 
 				startTimeMargin := int64(2 * time.Duration(cfg.tsdb.MinBlockDuration).Seconds() * 1000)
 				localStorage.Set(db, startTimeMargin)
+				// 通过 DBOpen渠道发送信号
 				db.SetWriteNotified(remoteStorage)
-				close(dbOpen)
+				close(dbOpen) // 发送信号0
 				<-cancel
 				return nil
 			},
@@ -1196,8 +1255,11 @@ func main() {
 			},
 		)
 	}
+	// 如果是代理模式
 	if agentMode {
-		// WAL storage.
+		// WAL storage.  WAL表示写磁盘
+		// 10.代理模式是对远程写入的优化
+		// 在代理模式下 查询、告警、本地存储TSDB是被禁止的
 		opts := cfg.agent.ToAgentOptions()
 		cancel := make(chan struct{})
 		g.Add(
@@ -1237,8 +1299,9 @@ func main() {
 				)
 
 				localStorage.Set(db, 0)
+				// 通过 DBOpen渠道发送信号
 				db.SetWriteNotified(remoteStorage)
-				close(dbOpen)
+				close(dbOpen) // 发送信号0
 				<-cancel
 				return nil
 			},
@@ -1252,6 +1315,10 @@ func main() {
 	}
 	{
 		// Web handler.
+		// 11.开启web服务，监听端口9090
+		// 1、提供给第三方的查询API
+		// 2、暴露自身的metrics接口 供其他监控系统获取Prometheus的指标数据
+		// 3、提供Web UI 的数据来源
 		g.Add(
 			func() error {
 				if err := webHandler.Run(ctxWeb, listener, *webConfig); err != nil {
@@ -1266,6 +1333,8 @@ func main() {
 	}
 	{
 		// Notifier.
+		// 12.启动Notifier模块，Notifier启动后，监听 Notify discovery manager的chan,
+		// 获取AlterManager的地址，以备发送告警使用。
 
 		// Calling notifier.Stop() before ruleManager.Stop() will cause a panic if the ruleManager isn't running,
 		// so keep this interrupt after the ruleManager.Stop().
@@ -1293,6 +1362,8 @@ func main() {
 	level.Info(logger).Log("msg", "See you next time!")
 }
 
+// openDBWithMetrics 打开指定目录下的本地 TSDB，并向注册器额外注册三个
+// TSDB 相关指标：数据库中最早的样本时间戳、Head 块的最小/最大时间边界。
 func openDBWithMetrics(dir string, logger log.Logger, reg prometheus.Registerer, opts *tsdb.Options, stats *tsdb.DBStats) (*tsdb.DB, error) {
 	db, err := tsdb.Open(
 		dir,
@@ -1328,27 +1399,38 @@ func openDBWithMetrics(dir string, logger log.Logger, reg prometheus.Registerer,
 	return db, nil
 }
 
+// safePromQLNoStepSubqueryInterval 以原子方式保存 PromQL 无 step 子查询
+// 的默认评估间隔，可在配置重载时被安全地并发读写。
 type safePromQLNoStepSubqueryInterval struct {
 	value atomic.Int64
 }
 
+// durationToInt64Millis 将 time.Duration 转换为毫秒数（int64）。
 func durationToInt64Millis(d time.Duration) int64 {
 	return int64(d / time.Millisecond)
 }
 
+// Set 更新无 step 子查询的默认评估间隔。
 func (i *safePromQLNoStepSubqueryInterval) Set(ev model.Duration) {
 	i.value.Store(durationToInt64Millis(time.Duration(ev)))
 }
 
+// Get 返回当前的无 step 子查询默认评估间隔（毫秒）。
+// 参数为兼容 promql.EngineOpts.NoStepSubqueryIntervalFn 的函数签名而保留，未使用。
 func (i *safePromQLNoStepSubqueryInterval) Get(int64) int64 {
 	return i.value.Load()
 }
 
+// reloader 描述一个配置重载执行单元：name 为组件名称（用于记录重载耗时），
+// reloader 是将该组件切换到新配置的回调函数。
 type reloader struct {
 	name     string
 	reloader func(*config.Config) error
 }
 
+// reloadConfig 重新加载配置文件并依次将其应用到所有 reloader 组件。
+// 成功后更新 configSuccess/configSuccessTime 指标、按配置调整 GOGC，
+// 并记录整体与各组件的重载耗时；任一组件应用失败则返回错误。
 func reloadConfig(filename string, expandExternalLabels, enableExemplarStorage bool, logger log.Logger, noStepSuqueryInterval *safePromQLNoStepSubqueryInterval, rls ...reloader) (err error) {
 	start := time.Now()
 	timings := []interface{}{}
@@ -1395,6 +1477,8 @@ func reloadConfig(filename string, expandExternalLabels, enableExemplarStorage b
 	return nil
 }
 
+// updateGoGC 根据配置中的 runtime.gogc 调整 Go GC 百分比，
+// 并将新值写入 GOGC 环境变量，以便 runtime API 对外展示。
 func updateGoGC(conf *config.Config, logger log.Logger) {
 	oldGoGC := debug.SetGCPercent(conf.Runtime.GoGC)
 	if oldGoGC != conf.Runtime.GoGC {
@@ -1408,6 +1492,8 @@ func updateGoGC(conf *config.Config, logger log.Logger) {
 	}
 }
 
+// startsOrEndsWithQuote 判断字符串是否以单引号或双引号开头或结尾，
+// 用于校验外部 URL 的合法性。
 func startsOrEndsWithQuote(s string) bool {
 	return strings.HasPrefix(s, "\"") || strings.HasPrefix(s, "'") ||
 		strings.HasSuffix(s, "\"") || strings.HasSuffix(s, "'")
@@ -1464,6 +1550,8 @@ type readyStorage struct {
 	stats           *tsdb.DBStats
 }
 
+// ApplyConfig 将配置应用到内部持有的 TSDB 存储；若底层存储尚未就绪
+// 或类型不是 *tsdb.DB（如 Agent 模式），则不做任何处理。
 func (s *readyStorage) ApplyConfig(conf *config.Config) error {
 	db := s.get()
 	if db, ok := db.(*tsdb.DB); ok {
@@ -1481,6 +1569,7 @@ func (s *readyStorage) Set(db storage.Storage, startTimeMargin int64) {
 	s.startTimeMargin = startTimeMargin
 }
 
+// get 返回当前持有的底层存储；若尚未通过 Set 设置，则返回 nil（表示未就绪）。
 func (s *readyStorage) get() storage.Storage {
 	s.mtx.RLock()
 	x := s.db
@@ -1488,6 +1577,7 @@ func (s *readyStorage) get() storage.Storage {
 	return x
 }
 
+// getStats 返回 TSDB 的统计信息（如 WAL 重放进度）。
 func (s *readyStorage) getStats() *tsdb.DBStats {
 	s.mtx.RLock()
 	x := s.stats
@@ -1534,6 +1624,8 @@ func (s *readyStorage) ChunkQuerier(mint, maxt int64) (storage.ChunkQuerier, err
 	return nil, tsdb.ErrNotReady
 }
 
+// ExemplarQuerier 实现 Storage 接口，返回 exemplar 查询器；
+// 仅 TSDB 模式支持，Agent 模式返回 agent.ErrUnsupported。
 func (s *readyStorage) ExemplarQuerier(ctx context.Context) (storage.ExemplarQuerier, error) {
 	if x := s.get(); x != nil {
 		switch db := x.(type) {
@@ -1556,6 +1648,8 @@ func (s *readyStorage) Appender(ctx context.Context) storage.Appender {
 	return notReadyAppender{}
 }
 
+// notReadyAppender 是底层存储尚未就绪时 Appender 的占位实现，
+// 所有写入/提交/回滚操作均返回 tsdb.ErrNotReady。
 type notReadyAppender struct{}
 
 func (n notReadyAppender) Append(ref storage.SeriesRef, l labels.Labels, t int64, v float64) (storage.SeriesRef, error) {
@@ -1709,6 +1803,8 @@ type tsdbOptions struct {
 	EnableNativeHistograms         bool
 }
 
+// ToTSDBOptions 将带单位的 tsdbOptions 转换为 tsdb.Options，
+// 时长类字段统一换算为毫秒，并默认启用重叠块压缩（EnableOverlappingCompaction）。
 func (opts tsdbOptions) ToTSDBOptions() tsdb.Options {
 	return tsdb.Options{
 		WALSegmentSize:                 int(opts.WALSegmentSize),
@@ -1743,6 +1839,8 @@ type agentOptions struct {
 	NoLockfile             bool
 }
 
+// ToAgentOptions 将带单位的 agentOptions 转换为 agent.Options，
+// 时长类字段统一换算为毫秒。
 func (opts agentOptions) ToAgentOptions() agent.Options {
 	return agent.Options{
 		WALSegmentSize:    int(opts.WALSegmentSize),
