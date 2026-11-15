@@ -1683,12 +1683,15 @@ func (h *Head) getOrCreate(hash uint64, lset labels.Labels) (*memSeries, bool, e
 	// Just using `getOrCreateWithID` below would be semantically sufficient, but we'd create
 	// a new series on every sample inserted via Add(), which causes allocations
 	// and makes our series IDs rather random and harder to compress in postings.
+	// 仅使用下面的 `getOrCreateWithID` 在语义上是足够的，但我们会在通过 Add() 插入的每个样本上创建一个新的系列，
+	// 这会导致分配，并使我们的系列 ID 相当随机，更难在 postings 中压缩。
 	s := h.series.getByHash(hash, lset)
 	if s != nil {
 		return s, false, nil
 	}
 
 	// Optimistically assume that we are the first one to create the series.
+	// 乐观地假设我们是第一个创建这个系列的人
 	id := chunks.HeadSeriesRef(h.lastSeriesID.Inc())
 
 	return h.getOrCreateWithID(id, hash, lset)
@@ -1817,6 +1820,8 @@ func (m *seriesHashmap) del(hash uint64, ref chunks.HeadSeriesRef) {
 	}
 }
 
+// 拆分锁
+// golang中的map不是并发安全的，而Prometheus中有大量的memSeries的增删操作
 const (
 	// DefaultStripeSize is the default number of entries to allocate in the stripeSeries hash map.
 	DefaultStripeSize = 1 << 14
@@ -1828,6 +1833,8 @@ const (
 // The locks are padded to not be on the same cache line. Filling the padded space
 // with the maps was profiled to be slower – likely due to the additional pointer
 // dereferences.
+// 如果产生hash碰撞，则直接使用label进行匹配。
+// Prometheus在内存中维护了两张hash表，无论时使用ref还是label都能很快找到对应的memSeries
 type stripeSeries struct {
 	size                    int
 	series                  []map[chunks.HeadSeriesRef]*memSeries // Sharded by ref. A series ref is the value of `size` when the series was being newly added.
@@ -1836,6 +1843,9 @@ type stripeSeries struct {
 	seriesLifecycleCallback SeriesLifecycleCallback
 }
 
+// 初始化head的时候生成16384个小哈希表，如果想根据ref找到memseries，
+// 只需要把ref对16384取模找到对应的series[x]，只需要lock[x]，
+// 从而大大降低了读写memseries时对锁的抢占造成的消耗，提升读写吞吐量。
 type stripeLock struct {
 	sync.RWMutex
 	// Padding to avoid multiple locks being on the same cache line.
@@ -1980,6 +1990,9 @@ func (s *stripeSeries) getByID(id chunks.HeadSeriesRef) *memSeries {
 	return series
 }
 
+// 这里取模的操作是& 并非%
+// 是因为 位运算&效率远高于取模运算%
+// 这里是位运算直接对内存操作，因而不需要转换成10进制，因此处理速度很快。
 func (s *stripeSeries) getByHash(hash uint64, lset labels.Labels) *memSeries {
 	i := hash & uint64(s.size-1)
 
@@ -2061,9 +2074,12 @@ func (s sample) Type() chunkenc.ValueType {
 
 // memSeries is the in-memory representation of a series. None of its methods
 // are goroutine safe and it is the caller's responsibility to lock it.
+// memSeries 是序列的内存表示。
+// 它的任何方法都不是 goroutine 安全的，调用者有责任对其进行加锁。
 type memSeries struct {
 	sync.Mutex
-
+	// 这个series的uid
+	// 在 'func (h *Head) getOrCreate(hash uint64, lset labels.Labels)' 函数中给出了明确解释
 	ref  chunks.HeadSeriesRef
 	lset labels.Labels
 	meta *metadata.Metadata

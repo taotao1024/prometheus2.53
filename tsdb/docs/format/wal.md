@@ -25,11 +25,11 @@ The type flag has the following states:
 * `3`: middle fragment of a record
 * `4`: final fragment of a record
 
-## Record encoding
+## Record encoding 记录编码
 
 The records written to the write ahead log are encoded as follows:
 
-### Series records
+### Series records 系列记录
 
 Series records encode the labels that identifies a series and its unique ID.
 
@@ -50,7 +50,7 @@ Series records encode the labels that identifies a series and its unique ID.
 └────────────────────────────────────────────┘
 ```
 
-### Sample records
+### Sample records 样本记录
 
 Sample records encode samples as a list of triples `(series_id, timestamp, value)`.
 Series reference and timestamp are encoded as deltas w.r.t the first sample.
@@ -71,7 +71,7 @@ The first sample record begins at the second row.
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-### Tombstone records
+### Tombstone records 墓碑记录
 
 Tombstone records encode tombstones as a list of triples `(series_id, min_time, max_time)`
 and specify an interval for which samples of a series got deleted.

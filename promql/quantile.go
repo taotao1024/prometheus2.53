@@ -51,14 +51,20 @@ var excludedLabels = []string{
 	labels.BucketLabel,
 }
 
+// bucket 表示经典直方图的一个桶：upperBound 为桶的上边界，count 为
+// 累计观测数（该桶及所有更小桶的观测总和，即 cumulative count）。
 type bucket struct {
 	upperBound float64
 	count      float64
 }
 
 // buckets implements sort.Interface.
+// buckets 实现了 sort.Interface，支持按 upperBound 排序。
 type buckets []bucket
 
+// metricWithBuckets 将一组桶与其所属的标签集（除去 metric name 和 le
+// 之外的所有标签，用于标识同一直方图）关联在一起，
+// 是 histogram_quantile 函数按标签分组计算分位数时的中间结构。
 type metricWithBuckets struct {
 	metric  labels.Labels
 	buckets buckets
@@ -95,6 +101,7 @@ type metricWithBuckets struct {
 // and another bool to indicate if small differences between buckets (that
 // are likely artifacts of floating point precision issues) have been
 // ignored.
+// 经典直方图分位数：排序 → 合并同界桶 → 强制单调 → 二分定位桶 → 桶内线性插值
 func bucketQuantile(q float64, buckets buckets) (float64, bool, bool) {
 	if math.IsNaN(q) {
 		return math.NaN(), false, false
@@ -120,22 +127,28 @@ func bucketQuantile(q float64, buckets buckets) (float64, bool, bool) {
 	}
 
 	buckets = coalesceBuckets(buckets)
+	// 修正桶计数：忽略浮点精度造成的微小差异，并强制桶计数单调递增
 	forcedMonotonic, fixedPrecision := ensureMonotonicAndIgnoreSmallDeltas(buckets, smallDeltaTolerance)
 
 	if len(buckets) < 2 {
 		return math.NaN(), false, false
 	}
+	// 总观测数 = 最大桶（+Inf 桶）的累计计数
 	observations := buckets[len(buckets)-1].count
 	if observations == 0 {
 		return math.NaN(), false, false
 	}
+	// φ 分位数对应的目标排名（第 rank 个观测）
 	rank := q * observations
+	// 二分查找第一个累计计数 >= rank 的桶，即分位数落入的桶
 	b := sort.Search(len(buckets)-1, func(i int) bool { return buckets[i].count >= rank })
 
 	if b == len(buckets)-1 {
+		// 分位数落入 +Inf 桶：无法插值，返回次高桶的上边界作为估计值
 		return buckets[len(buckets)-2].upperBound, forcedMonotonic, fixedPrecision
 	}
 	if b == 0 && buckets[0].upperBound <= 0 {
+		// 分位数落入上边界 <= 0 的最低桶：无法向 0 插值，直接返回其上边界
 		return buckets[0].upperBound, forcedMonotonic, fixedPrecision
 	}
 	var (
@@ -144,10 +157,13 @@ func bucketQuantile(q float64, buckets buckets) (float64, bool, bool) {
 		count       = buckets[b].count
 	)
 	if b > 0 {
+		// 换算为分位数所在桶内的局部值：
+		// 桶下边界 = 前一桶的上边界；桶内观测数 / 桶内排名 = 减去前桶累计值
 		bucketStart = buckets[b-1].upperBound
 		count -= buckets[b-1].count
 		rank -= buckets[b-1].count
 	}
+	// 假设观测在桶内线性分布，按比例插值得到分位数估计值
 	return bucketStart + (bucketEnd-bucketStart)*(rank/count), forcedMonotonic, fixedPrecision
 }
 
@@ -174,6 +190,7 @@ func bucketQuantile(q float64, buckets buckets) (float64, bool, bool) {
 // If q>1, +Inf is returned.
 //
 // If q is NaN, NaN is returned.
+// 原生直方图（NHCB）分位数：迭代桶累积计数定位，q≥0.5 时用反向迭代器优化
 func histogramQuantile(q float64, h *histogram.FloatHistogram) float64 {
 	if q < 0 {
 		return math.Inf(-1)
@@ -389,6 +406,7 @@ func coalesceBuckets(buckets buckets) buckets {
 //
 // We return a bool to indicate if this monotonicity was forced or not, and
 // another bool to indicate if small deltas were ignored or not.
+// 忽略微小浮点误差 + 强制桶计数单调递增（二分查找的前提）
 func ensureMonotonicAndIgnoreSmallDeltas(buckets buckets, tolerance float64) (bool, bool) {
 	var forcedMonotonic, fixedPrecision bool
 	prev := buckets[0].count
@@ -425,6 +443,7 @@ func ensureMonotonicAndIgnoreSmallDeltas(buckets buckets, tolerance float64) (bo
 // If q==NaN, NaN is returned.
 // If q<0, -Inf is returned.
 // If q>1, +Inf is returned.
+// 普通样本向量的分位数：排序后按加权平均插值（quantile() 函数用）
 func quantile(q float64, values vectorByValueHeap) float64 {
 	if len(values) == 0 || math.IsNaN(q) {
 		return math.NaN()

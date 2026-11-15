@@ -191,16 +191,16 @@ func (a *xorAppender) Append(t int64, v float64) {
 		case dod == 0:
 			a.b.writeBit(zero)
 		case bitRange(dod, 14):
-			a.b.writeBits(0b10, 2)
+			a.b.writeBits(0b10, 2) // '10'
 			a.b.writeBits(uint64(dod), 14)
 		case bitRange(dod, 17):
-			a.b.writeBits(0b110, 3)
+			a.b.writeBits(0b110, 3) // '110'
 			a.b.writeBits(uint64(dod), 17)
 		case bitRange(dod, 20):
-			a.b.writeBits(0b1110, 4)
+			a.b.writeBits(0b1110, 4) // '1110'
 			a.b.writeBits(uint64(dod), 20)
 		default:
-			a.b.writeBits(0b1111, 4)
+			a.b.writeBits(0b1111, 4) // '11110'
 			a.b.writeBits(uint64(dod), 64)
 		}
 

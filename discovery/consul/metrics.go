@@ -32,6 +32,10 @@ type consulMetrics struct {
 }
 
 func newDiscovererMetrics(reg prometheus.Registerer, rmi discovery.RefreshMetricsInstantiator) discovery.DiscovererMetrics {
+	// 给 Summary 设置误差值
+	// 0.5	的误差为 	0.05
+	// 0.9	的误差为 	0.01
+	// 0.99	的误差为	0.001
 	m := &consulMetrics{
 		rpcFailuresCount: prometheus.NewCounter(
 			prometheus.CounterOpts{
