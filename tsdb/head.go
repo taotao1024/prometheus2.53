@@ -1710,12 +1710,13 @@ func (h *Head) getOrCreateWithID(id chunks.HeadSeriesRef, hash uint64, lset labe
 		return nil, false, err
 	}
 	if !created {
+		// 如果不是一个新创建的值，则返回
 		return s, false, nil
 	}
 
 	h.metrics.seriesCreated.Inc()
 	h.numSeries.Inc()
-
+	// tsdb/index/postings.go:365
 	h.postings.Add(storage.SeriesRef(id), lset)
 	return s, true, nil
 }

@@ -54,7 +54,10 @@ var ensureOrderBatchPool = sync.Pool{
 // EnsureOrder() must be called once before any reads are done. This allows for quick
 // unordered batch fills on startup.
 type MemPostings struct {
-	mtx     sync.RWMutex
+	mtx sync.RWMutex
+	// 核心结构 MemPostings 是一个双层map
+	// 把 tag=value 的记录按照tag作为第一层map的key value作为内层map的key
+	// 内层map的值对应id set
 	m       map[string]map[string][]storage.SeriesRef
 	ordered bool
 }
@@ -366,6 +369,7 @@ func (p *MemPostings) Add(id storage.SeriesRef, lset labels.Labels) {
 	p.mtx.Lock()
 
 	lset.Range(func(l labels.Label) {
+		// 主要函数
 		p.addFor(id, l)
 	})
 	p.addFor(id, allPostingsKey)
@@ -389,10 +393,15 @@ func (p *MemPostings) addFor(id storage.SeriesRef, l labels.Label) {
 	// be generated independently before adding them to postings.
 	// We repair order violations on insert. The invariant is that the first n-1
 	// items in the list are already sorted.
+	// 不能保证没有更高的 ID 在之前被插入，
+	// 因为它们可能在添加到帖文之前独立生成。我们在插入时修复顺序违规。
+	// 约束条件是列表中的前 n-1 个项目已经排序。
 	for i := len(list) - 1; i >= 1; i-- {
 		if list[i] >= list[i-1] {
 			break
 		}
+		// 交换
+		// 通过排序 提升查询时的效率
 		list[i], list[i-1] = list[i-1], list[i]
 	}
 }

@@ -5,7 +5,7 @@
 ## 内存数据结构
 ![TSDB-本地存储-2.png](images/TSDB-%E6%9C%AC%E5%9C%B0%E5%AD%98%E5%82%A8-2.png)
  - 在Prometheus的内存中使用memSeries结构存储时间序列，一条时间序列对应一个memSeries
- - [head.go](../../tsdb/head.go) 2065行
+ - [head.go](../../tsdb/head.go) tsdb/head.go:2080
  - ```
     type memSeries struct {
         sync.Mutex
