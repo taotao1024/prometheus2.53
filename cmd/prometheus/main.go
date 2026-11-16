@@ -81,6 +81,8 @@ import (
 	"github.com/prometheus/prometheus/util/logging"
 	prom_runtime "github.com/prometheus/prometheus/util/runtime"
 	"github.com/prometheus/prometheus/web"
+
+	"github.com/prometheus/prometheus/test_mock/hotReload"
 )
 
 var (
@@ -207,6 +209,7 @@ func (c *flagConfig) setFeatureListOptions(logger log.Logger) error {
 				c.scrape.ExtraMetrics = true
 				level.Info(logger).Log("msg", "Experimental additional scrape metrics enabled")
 			case "new-service-discovery-manager":
+				// 服务发现配置 discovery.Manager | legacymanager.Manager
 				c.enableNewSDManager = true
 				level.Info(logger).Log("msg", "Experimental service discovery manager")
 			case "agent":
@@ -269,6 +272,34 @@ func (c *flagConfig) setFeatureListOptions(logger log.Logger) error {
  * SkyWalking中 使用SPI机制 管理各模块的启动
  */
 func main() {
+
+	// 热重载 {{
+	// 支持子命令：prometheus reload / prometheus stop
+	// 读取 prometheus.pid 中记录的进程号，并向该进程发送 SIGHUP / SIGTERM 信号
+	manager := hotReload.NewManager()
+	// 注意：必须先判断 len(os.Args) > 1，否则无参数启动时会数组越界 panic
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "reload":
+			if err := manager.Reload(); err != nil {
+				fmt.Println(err)
+				os.Exit(1)
+			}
+			fmt.Println("reload Success")
+			return
+		case "stop":
+			if err := manager.Stop(); err != nil {
+				fmt.Println(err)
+				os.Exit(1)
+			}
+			fmt.Println("stop Success")
+			return
+		default:
+			// 非子命令（如 --config.file=xxx），走正常启动流程
+		}
+	}
+	// }}
+
 	if os.Getenv("DEBUG") != "" {
 		runtime.SetBlockProfileRate(20)
 		runtime.SetMutexProfileFraction(20)
@@ -673,8 +704,9 @@ func main() {
 	level.Info(logger).Log("vm_limits", prom_runtime.VMLimits())
 
 	var (
-		localStorage  = &readyStorage{stats: tsdb.NewDBStats()}
-		scraper       = &readyScrapeManager{}
+		localStorage = &readyStorage{stats: tsdb.NewDBStats()}
+		scraper      = &readyScrapeManager{}
+		// storage 存储层
 		remoteStorage = remote.NewStorage(log.With(logger, "component", "remote"), prometheus.DefaultRegisterer, localStorage.StartTime, localStoragePath, time.Duration(cfg.RemoteFlushDeadline), scraper)
 		fanoutStorage = storage.NewFanout(logger, localStorage, remoteStorage)
 	)
@@ -687,8 +719,8 @@ func main() {
 
 		ctxScrape, cancelScrape = context.WithCancel(context.Background())
 		ctxNotify, cancelNotify = context.WithCancel(context.Background())
-		discoveryManagerScrape  discoveryManager
-		discoveryManagerNotify  discoveryManager
+		discoveryManagerScrape  discoveryManager // 服务发现消费方
+		discoveryManagerNotify  discoveryManager // 服务发下消费方
 	)
 
 	// Kubernetes client metrics are used by Kubernetes SD.
@@ -702,14 +734,18 @@ func main() {
 		os.Exit(1)
 	}
 
+	// 注册各 SD 指标（只允许调用一次）
 	sdMetrics, err := discovery.CreateAndRegisterSDMetrics(prometheus.DefaultRegisterer)
 	if err != nil {
 		level.Error(logger).Log("msg", "failed to register service discovery metrics", "err", err)
 		os.Exit(1)
 	}
-
+	// 切换旧实现：--enable-feature=new-service-discovery-manager
+	// 决定用 discovery.Manager 还是 legacymanager.Manager
+	// 创建两套管理器：抓取发现 & 通知发现
 	if cfg.enableNewSDManager {
 		{
+			// 抓取发现
 			discMgr := discovery.NewManager(ctxScrape, log.With(logger, "component", "discovery manager scrape"), prometheus.DefaultRegisterer, sdMetrics, discovery.Name("scrape"))
 			if discMgr == nil {
 				level.Error(logger).Log("msg", "failed to create a discovery manager scrape")
@@ -719,6 +755,7 @@ func main() {
 		}
 
 		{
+			// 通知发现
 			discMgr := discovery.NewManager(ctxNotify, log.With(logger, "component", "discovery manager notify"), prometheus.DefaultRegisterer, sdMetrics, discovery.Name("notify"))
 			if discMgr == nil {
 				level.Error(logger).Log("msg", "failed to create a discovery manager notify")
@@ -728,6 +765,7 @@ func main() {
 		}
 	} else {
 		{
+			// 抓取发现
 			discMgr := legacymanager.NewManager(ctxScrape, log.With(logger, "component", "discovery manager scrape"), prometheus.DefaultRegisterer, sdMetrics, legacymanager.Name("scrape"))
 			if discMgr == nil {
 				level.Error(logger).Log("msg", "failed to create a discovery manager scrape")
@@ -737,6 +775,7 @@ func main() {
 		}
 
 		{
+			// 通知发现
 			discMgr := legacymanager.NewManager(ctxNotify, log.With(logger, "component", "discovery manager notify"), prometheus.DefaultRegisterer, sdMetrics, legacymanager.Name("notify"))
 			if discMgr == nil {
 				level.Error(logger).Log("msg", "failed to create a discovery manager notify")
@@ -745,7 +784,7 @@ func main() {
 			discoveryManagerNotify = discMgr
 		}
 	}
-
+	// 抓取引擎
 	scrapeManager, err := scrape.NewManager(
 		&cfg.scrape,
 		log.With(logger, "component", "scrape manager"),
@@ -802,9 +841,9 @@ func main() {
 			EnableNegativeOffset: true,
 			EnablePerStepStats:   cfg.enablePerStepStats,
 		}
-
+		// PromQL 引擎入口
 		queryEngine = promql.NewEngine(opts)
-
+		// Prometheus Server 模式的规则评估引擎
 		ruleManager = rules.NewManager(&rules.ManagerOptions{
 			Appendable:             fanoutStorage,
 			Queryable:              localStorage,
@@ -920,7 +959,8 @@ func main() {
 				for _, v := range scfgs {
 					c[v.JobName] = v.ServiceDiscoveryConfigs
 				}
-				return discoveryManagerScrape.ApplyConfig(c)
+				// 配置热重载时刷新
+				return discoveryManagerScrape.ApplyConfig(c) // reloaders 中的 "scrape_sd"
 			},
 		}, {
 			name:     "notify",
@@ -1034,15 +1074,20 @@ func main() {
 			func(err error) {
 				close(cancel)
 				webHandler.SetReady(false)
+				// 退出时删除 prometheus.pid 文件（所有退出路径都会经过这里）
+				if err := manager.RemovePid(); err != nil {
+					level.Error(logger).Log("msg", "failed to remove pid file", "err", err)
+				}
 			},
 		)
 	}
 	{
 		// Scrape discovery manager. 被监控对象地址
-		// 2.开启 Scrape discovery manager，对被监控对象target进行服务发现。
-		// 将获取到的地址发送到自身的chan,供Scrape manager模块获取
+		// 2.开启 Scrape discovery manager，对被监控对象target进行 服务发现。
+		// 从各类来源（K8s、Consul、DNS、AWS…）发现抓取目标，把目标组通过 channel 交给抓取管理器 / 通知管理器。
 		g.Add(
 			func() error {
+				// 启动 + 输出目标组
 				err := discoveryManagerScrape.Run()
 				level.Info(logger).Log("msg", "Scrape discovery manager stopped")
 				return err
@@ -1094,8 +1139,8 @@ func main() {
 				// It depends on the config being in sync with the discovery manager so
 				// we wait until the config is fully loaded.
 				<-reloadReady.C
-
-				err := scrapeManager.Run(discoveryManagerScrape.SyncCh())
+				// 抓取引擎
+				err := scrapeManager.Run(discoveryManagerScrape.SyncCh()) // 服务发现的消费方
 				level.Info(logger).Log("msg", "Scrape manager stopped")
 				return err
 			},
@@ -1352,7 +1397,7 @@ func main() {
 				// so we wait until the config is fully loaded.
 				<-reloadReady.C
 
-				notifierManager.Run(discoveryManagerNotify.SyncCh())
+				notifierManager.Run(discoveryManagerNotify.SyncCh()) // 服务发现的消费方
 				level.Info(logger).Log("msg", "Notifier manager stopped")
 				return nil
 			},
@@ -1361,6 +1406,18 @@ func main() {
 			},
 		)
 	}
+
+	// 启动时写入pid文件
+	// 注意：放在 g.Run() 之前，保证 pid 文件先于 Termination handler 的清理逻辑创建
+	if err := manager.CreateAndRecordPid(); err != nil {
+		level.Error(logger).Log("err", err)
+		os.Exit(1)
+	}
+	// 退出删除pid文件：不要用 defer！
+	// g.Run() 出错时走 os.Exit(1)，defer 不会执行，pid 文件会残留；
+	// 改为在 Termination handler 的清理回调中删除（见上方 g.Add）。
+
+	// 正式启动服务
 	if err := g.Run(); err != nil {
 		level.Error(logger).Log("err", err)
 		os.Exit(1)
@@ -1371,6 +1428,7 @@ func main() {
 // openDBWithMetrics 打开指定目录下的本地 TSDB，并向注册器额外注册三个
 // TSDB 相关指标：数据库中最早的样本时间戳、Head 块的最小/最大时间边界。
 func openDBWithMetrics(dir string, logger log.Logger, reg prometheus.Registerer, opts *tsdb.Options, stats *tsdb.DBStats) (*tsdb.DB, error) {
+	// TSDB 访问入口
 	db, err := tsdb.Open(
 		dir,
 		log.With(logger, "component", "tsdb"),
