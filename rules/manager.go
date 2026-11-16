@@ -78,6 +78,7 @@ func DefaultEvalIterationFunc(ctx context.Context, g *Group, evalTimestamp time.
 	g.metrics.IterationsScheduled.WithLabelValues(GroupKey(g.file, g.name)).Inc()
 
 	start := time.Now()
+	// Eval 运行一个单一的评估周期，其中所有规则按顺序进行评估。
 	g.Eval(ctx, evalTimestamp)
 	timeSinceStart := time.Since(start)
 
@@ -385,6 +386,7 @@ func (m *Manager) Rules() []Rule {
 }
 
 // AlertingRules returns the list of the manager's alerting rules.
+// AlertingRules 返回管理员的告警规则列表。
 func (m *Manager) AlertingRules() []*AlertingRule {
 	alerts := []*AlertingRule{}
 	for _, rule := range m.Rules() {

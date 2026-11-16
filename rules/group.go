@@ -440,27 +440,50 @@ func (g *Group) CopyState(from *Group) {
 
 // Eval runs a single evaluation cycle in which all rules are evaluated sequentially.
 // Rules can be evaluated concurrently if the `concurrent-rule-eval` feature flag is enabled.
+//
+// Eval 运行规则组的一个完整评估周期。默认顺序执行组内全部规则；
+// 启用 `concurrent-rule-eval` 特性后，组内无依赖关系的规则可受限并发。
+//
+// 整体流程：
+//  1. 规则求值（多态调用 promql 引擎）；
+//  2. 告警规则结果经 NotifyFunc 推送给 notifier（唯一的通知交接点）；
+//  3. 全部结果样本通过 Appender 写入存储；
+//  4. 上一周期输出、本周期消失的 series 补写 StaleNaN（staleness 标记）；
+//  5. 更新指标并清理"规则被删除"遗留的跨周期 stale series。
+//
+// 参数：
+//   - ctx: 评估上下文。shutdown 时会被取消，进行中的求值随之终止（取消错误不记日志）；
+//   - ts:  评估时间槽，由 EvalTimestamp 按对齐间隔算出的调度时间（非墙钟时间），
+//     本周期内所有写入样本（含 staleness 标记）的时间戳都使用它。
 func (g *Group) Eval(ctx context.Context, ts time.Time) {
 	var (
-		samplesTotal atomic.Float64
-		wg           sync.WaitGroup
+		samplesTotal atomic.Float64 // 本周期全部规则产出的样本总数，收尾时写入 GroupSamples 指标
+		wg           sync.WaitGroup // 等待本周期所有并发求值的 goroutine 退出
 	)
 
+	// 规则求值时间偏移：组级 query_offset 覆盖 → 全局 --rules.query-offset 默认值 → 0。
+	// staleness 样本的时间戳也需减去它，与规则实际查询的数据时间对齐。
 	ruleQueryOffset := g.QueryOffset()
 
 	for i, rule := range g.rules {
 		select {
 		case <-g.done:
+			// 被 Stop/热重载替换时立即退出，不等剩余规则。
 			return
 		default:
 		}
 
+		// eval 闭包封装单条规则的完整处理：求值 → 告警发送 → 样本写入 → staleness 标记。
+		// cleanup 在闭包退出时释放并发槽（wg 计数 + 全局信号量），并发与顺序两条路径共用。
 		eval := func(i int, rule Rule, cleanup func()) {
 			if cleanup != nil {
 				defer cleanup()
 			}
 
+			// 日志加 name/index 前缀，便于按规则定位问题。
 			logger := log.WithPrefix(g.logger, "name", rule.Name(), "index", i)
+			// 创建一条 "rule" span（tracer 由 tracing 包的全局 TracerProvider 提供）。
+			// span 被采样时把 trace_id 注入日志，实现规则评估与分布式追踪的关联。
 			ctx, sp := otel.Tracer("").Start(ctx, "rule")
 			sp.SetAttributes(attribute.String("name", rule.Name()))
 			defer func(t time.Time) {
@@ -478,6 +501,12 @@ func (g *Group) Eval(ctx context.Context, ts time.Time) {
 
 			g.metrics.EvalTotal.WithLabelValues(GroupKey(g.File(), g.Name())).Inc()
 
+			// 多态求值：AlertingRule.Eval（告警规则）或 RecordingRule.Eval（记录规则）。
+			//   - ruleQueryOffset: 求值内部对查询时间做偏移；
+			//   - g.Limit():       组级 limit，结果序列超限时截断并告警（防基数爆炸）。
+			// 失败：标记 HealthBad/SetLastError（供 GET /api/v1/rules 与 UI 展示）、
+			//       EvalFailures 指标 +1、span 置为 Error；
+			// 成功：标记 HealthGood、清除 LastError，并在 defer 中记录 EvalDuration/EvalTotal。
 			vector, err := rule.Eval(ctx, ruleQueryOffset, ts, g.opts.QueryFunc, g.opts.ExternalURL, g.Limit())
 			if err != nil {
 				rule.SetHealth(HealthBad)
@@ -497,6 +526,9 @@ func (g *Group) Eval(ctx context.Context, ts time.Time) {
 			rule.SetLastError(nil)
 			samplesTotal.Add(float64(len(vector)))
 
+			// 告警发送：仅告警规则走这一步。NotifyFunc 由 main.go 注入为
+			// rules.SendAlerts → notifier.Manager.Send，是规则引擎与通知子系统的唯一交接点。
+			// ResendDelay 控制重发间隔——Alertmanager 依赖周期性重发维持 firing 状态。
 			if ar, ok := rule.(*AlertingRule); ok {
 				ar.sendAlerts(ctx, ts, g.opts.ResendDelay, g.interval, g.opts.NotifyFunc)
 			}
@@ -506,6 +538,10 @@ func (g *Group) Eval(ctx context.Context, ts time.Time) {
 				numDuplicates = 0
 			)
 
+			// 获取 Appender，并在闭包退出时提交（defer 对并发/顺序两条路径均生效）。
+			//   - Commit 失败：HealthBad + EvalFailures，本周期样本全部丢弃；
+			//   - Commit 成功：本周期实际产出的 series 集合回填 seriesInPreviousEval[i]
+			//     ——每条规则独立一个槽位，是并发求值下"无共享写"的关键。
 			app := g.opts.Appendable.Appender(ctx)
 			seriesReturned := make(map[string]labels.Labels, len(g.seriesInPreviousEval[i]))
 			defer func() {
@@ -521,6 +557,7 @@ func (g *Group) Eval(ctx context.Context, ts time.Time) {
 				g.seriesInPreviousEval[i] = seriesReturned
 			}()
 
+			// 逐样本写入：原生直方图走 AppendHistogram，普通样本走 Append（ref=0 由存储按 series 匹配）。
 			for _, s := range vector {
 				if s.H != nil {
 					_, err = app.AppendHistogram(0, s.Metric, s.T, nil, s.H)
@@ -536,6 +573,8 @@ func (g *Group) Eval(ctx context.Context, ts time.Time) {
 					if unwrappedErr == nil {
 						unwrappedErr = err
 					}
+					// 写入错误分级处理：乱序/过旧/同时间戳重复 → Debug 并计数
+					// （多为多条规则输出重叠的正常现象），其它错误 → Warn。
 					switch {
 					case errors.Is(unwrappedErr, storage.ErrOutOfOrderSample):
 						numOutOfOrder++
@@ -551,6 +590,7 @@ func (g *Group) Eval(ctx context.Context, ts time.Time) {
 					}
 				} else {
 					buf := [1024]byte{}
+					// 成功的 series 记入 seriesReturned（Metric.Bytes(buf) 作 key 避免分配）。
 					seriesReturned[string(s.Metric.Bytes(buf[:]))] = s.Metric
 				}
 			}
@@ -564,6 +604,12 @@ func (g *Group) Eval(ctx context.Context, ts time.Time) {
 				level.Warn(logger).Log("msg", "Error on ingesting results from rule evaluation with different value but same timestamp", "num_dropped", numDuplicates)
 			}
 
+			// staleness 标记：上一周期输出、本周期不再输出的 series 追加 StaleNaN（model/value 包）。
+			//   - 时间戳取 ts-ruleQueryOffset，与规则实际查询的数据时间对齐，
+			//     避免 offset 与评估槽错位导致乱序；
+			//   - 乱序/过旧/重复三类错误静默忽略：该 series 可能正由另一条规则产生
+			//     （跨规则/跨组迁移时的正常现象）；
+			//   - 效果：规则输出消失后，查询立即不再返回旧值，无需等 5 分钟 lookback 过期。
 			for metric, lset := range g.seriesInPreviousEval[i] {
 				if _, ok := seriesReturned[metric]; !ok {
 					// Series no longer exposed, mark it stale.
@@ -588,6 +634,14 @@ func (g *Group) Eval(ctx context.Context, ts time.Time) {
 
 		// If the rule has no dependencies, it can run concurrently because no other rules in this group depend on its output.
 		// Try run concurrently if there are slots available.
+		// 并发评估的两级门槛（都满足才走 goroutine，否则顺序执行）：
+		//   1. 规则资格 isRuleEligibleForConcurrentExecution：本规则与组内其余规则无任何依赖关系
+		//      ——组内可能存在链式依赖（A 的输出是 B 的查询输入，如 record 规则串联），
+		//      有依赖的规则必须顺序执行，保证本周期内读到同一批数据；
+		//   2. 全局并发额度 RuleConcurrencyController：
+		//      启用 --enable-feature=concurrent-rule-eval 时为加权信号量
+		//      （--rules.max-concurrent-evals，默认 4）；未启用时为顺序控制器（Allow() 恒 false）。
+		//      并发额度是全局而非按组的，防止所有组同时并发压垮查询引擎。
 		if ctrl := g.concurrencyController; isRuleEligibleForConcurrentExecution(rule) && ctrl.Allow() {
 			wg.Add(1)
 
@@ -599,10 +653,15 @@ func (g *Group) Eval(ctx context.Context, ts time.Time) {
 			eval(i, rule, nil)
 		}
 	}
-
+	// 等待本周期所有并发求值完成后，再更新指标并处理跨周期 stale series。
 	wg.Wait()
 
 	g.metrics.GroupSamples.WithLabelValues(GroupKey(g.File(), g.Name())).Set(samplesTotal.Load())
+
+	// cleanupStaleSeries：补写"规则被删除"遗留的 stale series。
+	// 热重载时 CopyState 会把被删规则上一周期的输出归入 g.staleSeries，
+	// 这里统一为它们追加 StaleNaN——与 eval 内的 staleness 逻辑互补：
+	// eval 处理"输出消失"，这里处理"规则消失"。
 	g.cleanupStaleSeries(ctx, ts)
 }
 

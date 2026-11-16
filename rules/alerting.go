@@ -338,8 +338,10 @@ const resolvedRetention = 15 * time.Minute
 
 // Eval evaluates the rule expression and then creates pending alerts and fires
 // or removes previously pending alerts accordingly.
+// Eval 评估规则表达式，然后相应地创建待处理警报，并触发或移除先前的待处理警报。
 func (r *AlertingRule) Eval(ctx context.Context, queryOffset time.Duration, ts time.Time, query QueryFunc, externalURL *url.URL, limit int) (promql.Vector, error) {
 	ctx = NewOriginContext(ctx, NewRuleDetail(r))
+	// 查询
 	res, err := query(ctx, r.vector.String(), ts.Add(-queryOffset))
 	if err != nil {
 		return nil, err
@@ -356,7 +358,7 @@ func (r *AlertingRule) Eval(ctx context.Context, queryOffset time.Duration, ts t
 	for _, smpl := range res {
 		// Provide the alert information to the template.
 		l := smpl.Metric.Map()
-
+		// 模板
 		tmplData := template.AlertTemplateData(l, r.externalLabels, r.externalURL, smpl)
 		// Inject some convenience variables that are easier to remember for users
 		// who are not used to Go's templating system.
